@@ -37,3 +37,7 @@ build/
 
 ### Mac OS ###
 .DS_Store
+### workflow runtime local data ###
+/workflow-data/
+/smoke-data/
+/smoke.log
