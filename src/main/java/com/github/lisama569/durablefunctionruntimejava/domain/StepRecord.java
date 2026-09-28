@@ -1,7 +1,8 @@
 package com.github.lisama569.durablefunctionruntimejava.domain;
 
-/** 单个步骤的持久化记录：输入、输出、尝试次数与失败原因。 */
+/** 单个活动的持久化记录：节点 id、输入、输出、尝试次数与失败原因。 */
 public class StepRecord {
+    private String nodeId;
     private String name;
     private StepStatus status = StepStatus.PENDING;
     private int attempt;
@@ -17,6 +18,13 @@ public class StepRecord {
         this.name = name;
     }
 
+    public StepRecord(String nodeId, String name) {
+        this.nodeId = nodeId;
+        this.name = name;
+    }
+
+    public String getNodeId() { return nodeId; }
+    public void setNodeId(String nodeId) { this.nodeId = nodeId; }
     public String getName() { return name; }
     public void setName(String name) { this.name = name; }
     public StepStatus getStatus() { return status; }
