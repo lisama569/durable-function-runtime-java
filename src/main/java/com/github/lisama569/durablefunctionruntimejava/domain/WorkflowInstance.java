@@ -12,6 +12,11 @@ public class WorkflowInstance {
     private int currentStepIndex;
     private String input;
     private List<StepRecord> steps = new ArrayList<>();
+    /** 分支/并行模型的执行位置；旧串行实例（历史数据）为 null，恢复时惰性迁移。 */
+    private ExecutionState executionState;
+    /** 实例级失败归因（如分支选择器/汇合逻辑抛出异常）。 */
+    private ErrorKind errorKind;
+    private String errorMessage;
     private long createdAt;
     private long updatedAt;
     private long version;
@@ -30,6 +35,12 @@ public class WorkflowInstance {
     public void setInput(String input) { this.input = input; }
     public List<StepRecord> getSteps() { return steps; }
     public void setSteps(List<StepRecord> steps) { this.steps = steps; }
+    public ExecutionState getExecutionState() { return executionState; }
+    public void setExecutionState(ExecutionState executionState) { this.executionState = executionState; }
+    public ErrorKind getErrorKind() { return errorKind; }
+    public void setErrorKind(ErrorKind errorKind) { this.errorKind = errorKind; }
+    public String getErrorMessage() { return errorMessage; }
+    public void setErrorMessage(String errorMessage) { this.errorMessage = errorMessage; }
     public long getCreatedAt() { return createdAt; }
     public void setCreatedAt(long createdAt) { this.createdAt = createdAt; }
     public long getUpdatedAt() { return updatedAt; }
