@@ -38,11 +38,13 @@ engine.registerFlow(new FlowDefinition("orderFlowV2", List.of(
                 List.of(new FlowBranch("express",  List.of(new TaskNode("expressPick",  h, policy))),
                         new FlowBranch("standard", List.of(new TaskNode("standardPick", h, policy))))),
 
-        // 并行扇出：同时拉起 reserve / sendMessage 两路，全部完成后 join 恰好一次
+        // 并行扇出：同时拉起 reserve / sendMessage 两路，全部完成后 join 在 worker 线程执行
+        // （join 的重试/超时策略可选，默认 RetryPolicy.defaults()）
         new ParallelNode("notify",
                 List.of(new FlowBranch("reserve", List.of(new TaskNode("reserve",     h, policy))),
                         new FlowBranch("message", List.of(new TaskNode("sendMessage", h, policy)))),
-                (joinCtx, outputsInBranchOrder) -> String.join("+", outputsInBranchOrder)),
+                (joinCtx, outputsInBranchOrder) -> String.join("+", outputsInBranchOrder),
+                RetryPolicy.defaults()),
 
         new TaskNode("archive", handler, RetryPolicy.defaults()))));
 ```
@@ -63,9 +65,14 @@ engine.registerFlow(new FlowDefinition("orderFlowV2", List.of(
    - selector 抛异常或返回未知 label → 实例立即 `FAILED`（不重试，视为定义/数据错误）。
 5. **并行扇出/汇合（Parallel）**：
    - 节点激活时**同时**拉起每条分支的首个任务；各分支内部顺序推进，互不等待；
-   - 每条分支完成后独立持久化；**全部分支完成后汇合恰好执行一次**；
+   - 每条分支完成后独立持久化；**全部分支完成后汇合逻辑上恰好生效一次**；
    - `JoinHandler` 收到的输出列表**按分支定义顺序排列**，因此汇合结果与各路完成的先后顺序无关；
-   - 汇合逻辑在事件循环中同步执行，其成功与新的顶层游标在同一次持久化中落盘（崩溃时按既有 at-least-once 重放，业务汇合副作用需幂等，`JoinContext.idempotencyKey()` 稳定）。
+   - **汇合在 worker 线程执行，而不是事件循环线程**：某个实例的汇合再慢、甚至一直阻塞，
+     也只占用一个 worker，事件循环与其他实例照常推进，各实例状态流转互不影响；
+   - 汇合沿用与普通步骤**完全一致**的重试/超时/失败语义（策略由
+     `ParallelNode` 的 `joinRetryPolicy` 提供，默认 `RetryPolicy.defaults()`）；
+   - 汇合成功与新的顶层游标在同一次持久化中落盘。崩溃/超时导致「汇合副作用已生效而完成未持久化」时
+     按 at-least-once 重放，业务汇合副作用需幂等，`JoinContext.idempotencyKey()` 稳定。
 6. **持久化优先**：每次状态迁移先写盘后推进。文件写入采用「临时文件 + 原子 rename」，更新带 `version` 乐观锁。
 7. **完成通知去重**：事件处理前校验「实例 RUNNING + 记录 RUNNING + attempt 匹配 + 该路径正位于当前执行头」，
    任何重复/迟到通知（重试旧 attempt、超时后才返回、终态后到达）都被丢弃，终态不可逆。
@@ -77,21 +84,30 @@ engine.registerFlow(new FlowDefinition("orderFlowV2", List.of(
 步骤状态：`PENDING` / `RUNNING` / `COMPLETED` / `FAILED` / `SKIPPED`（未选分支）/ `CANCELLED`（被终态失败/终止停下的任务）。
 实例终态：`COMPLETED` / `FAILED` / `TIMED_OUT` / `TERMINATED`，均不可逆。
 
-## 重试、超时、失败与终止（并行下同样适用）
+## 重试、超时、失败与终止（并行与汇合同样适用）
 
-- 任务抛 `RetryableException` → 退避重试（`initialBackoff * 2^(attempt-1)`，封顶 `maxBackoff`）；
+- 任务/汇合抛 `RetryableException` → 退避重试（`initialBackoff * 2^(attempt-1)`，封顶 `maxBackoff`）；
 - 抛 `NonRetryableException` 或未分类异常 → **立即** `FAILED`；
-- 执行时长超过 `stepTimeoutMillis` → 取消 worker，可重试则退避，否则实例 `TIMED_OUT`；
+- 执行时长超过 `stepTimeoutMillis`（汇合使用 `joinRetryPolicy.stepTimeoutMillis`）→ 取消 worker（中断执行线程），可重试则退避，否则实例 `TIMED_OUT`；
 - 尝试次数硬性上限 `maxAttempts`；重试耗尽落入确定终态，不停留中间态。
+
+**汇合（join）的语义与普通步骤一致**：汇合在 worker 线程执行，因此——
+
+- 汇合**慢或一直不返回都不会阻塞事件循环**：同一个进程里其他实例的任务派发、状态流转照常进行，互不影响；
+- 汇合抛可重试错误时**按退避重试**（不再被直接判死），直到成功或达到 `maxAttempts`；
+- 汇合超过超时阈值会被判定**超时**并收到中断信号，超时与重试耗尽一样让实例进入 `TIMED_OUT`/`FAILED`；
+- 汇合重试/超时期间 `fan.join` 记录为 `RUNNING`、`attempt` 递增；成功才推进到下一个顶层节点。
 
 并行扇出时的额外保证：
 
-- **任一路**彻底失败或超时 → 整个实例立即进入确定终态（`FAILED`/`TIMED_OUT`）：
-  事件循环取消该实例**所有其他仍在运行**的任务（`Future.cancel(true)`），未执行的任务标记 `CANCELLED`，
-  汇合记录也置 `CANCELLED`，不留下后台任务继续改状态；其他分支迟到的完成通知一律丢弃。
+- **任一路或汇合**彻底失败或超时 → 整个实例立即进入确定终态（`FAILED`/`TIMED_OUT`）：
+  事件循环取消该实例**所有其他仍在运行**的任务（`Future.cancel(true)`，含卡住的汇合），未执行的任务标记 `CANCELLED`，
+  不留下后台任务继续改状态；其他分支/汇合迟到的完成通知一律丢弃。
   已正常 COMPLETED 的兄弟分支保留其结果（真实有效），不会被改写。
-- **扇出上限**：单个 `ParallelNode` 的分支数若超过 `workflow.max-parallel-branches`（默认 8），该实例立即 `FAILED`，
-  不拉起任何任务，避免一个实例铺开过多。
+- **扇出上限（注册期拒绝）**：单个 `ParallelNode` 的分支数若超过 `workflow.max-parallel-branches`（默认 8），
+  该流程在 `registerFlow(...)` 时就抛 `IllegalArgumentException` 被明确拒绝——**早于任何实例、任何任务的执行**，
+  不会出现「前面步骤已经跑完、产生副作用后才在并行点报错」。是否超限的结果在流程开跑前即确定、可预期；
+  分支数恰好等于上限合法。
 - **全局天花板**：worker 线程数由 `workflow.worker-threads`（默认 16）统一限制，任务在 FIFO 队列排队而不是无界扩张，
   避免并行实例把同进程其他实例饿死。实例间状态按文件与内存索引严格隔离，不串扰、不互相拖垮。
 - `terminate(instanceId)` 在并行期间同样生效：取消所有在跑任务，后续步骤/汇合不再执行，实例进入 `TERMINATED`。
@@ -111,7 +127,7 @@ engine.registerFlow(new FlowDefinition("orderFlowV2", List.of(
 | --- | --- | --- |
 | `workflow.data-dir` | `./workflow-data` | 实例 JSON 文件目录 |
 | `workflow.worker-threads` | `16` | 全局 worker 线程数（并行总闸） |
-| `workflow.max-parallel-branches` | `8` | 单实例单次并行扇出分支上限 |
+| `workflow.max-parallel-branches` | `8` | 单并行节点分支上限，超限的定义在 `registerFlow` 注册期即被拒绝 |
 
 ## REST 接口
 
@@ -131,12 +147,13 @@ curl -X POST http://localhost:8080/api/workflows/instances/<instanceId>/terminat
 ## 本地验证
 
 ```bash
-# 全量单测（25 个）
+# 全量单测（32 个）
 mvn test
 
 # 按场景单独验证
 mvn test -Dtest=WorkflowEngineBranchTest     # 分支选择、未选分支 SKIPPED、selector 失败、分支内重试
-mvn test -Dtest=WorkflowEngineParallelTest   # 并行乱序汇合、崩溃只补未完成分支、失败/超时取消、上限、终止、多实例隔离
+mvn test -Dtest=WorkflowEngineParallelTest   # 并行乱序汇合、崩溃只补未完成分支、失败/超时取消、上限注册期拒绝、终止、多实例隔离
+mvn test -Dtest=WorkflowEngineJoinTest       # 汇合阻塞不拖垮其他实例、汇合重试成功、汇合失败/超时入终态、汇合重试耗尽、汇合执行中崩溃恢复
 mvn test -Dtest=WorkflowEngineRetryTest      # 重试/超时/终止/失败原因（串行）
 mvn test -Dtest=WorkflowEngineRecoveryTest   # 崩溃重启恢复、已完成步骤不重跑
 mvn test -Dtest=WorkflowEngineConcurrencyTest# 幂等键并发去重、多实例并发隔离
@@ -154,10 +171,15 @@ mvn spring-boot:run
 4. **一路失败**：`NonRetryableException` 使实例 FAILED；其他在跑路收到取消信号，任务/汇合置 CANCELLED；
    放行后迟到完成通知不改变终态、不产生输出、不再触发汇合。
 5. **一路超时**：超时耗尽实例 TIMED_OUT，已完成兄弟保留 COMPLETED，汇合 CANCELLED。
-6. **扇出上限**：分支数超过单实例上限时立即 FAILED，且一个任务都不执行。
-7. **分支内重试**：并行某路可重试失败重试到成功，汇合仍只执行一次，attempt 计数正确。
+6. **扇出上限（注册期拒绝）**：分支数超过上限时 `registerFlow` 直接抛异常，流程根本无法启动，前置任务一次都不会执行；恰好等于上限合法并正常跑完。
+7. **分支内重试**：并行某路可重试失败重试到成功，汇合仍只生效一次，attempt 计数正确。
 8. **并行期间终止**：两路在跑时终止 → TERMINATED，所有路与后续步骤取消，汇合不执行。
 9. **多实例隔离**：8 个实例并行各自两路，结果不串扰，每路恰好一次、每实例汇合一次。
 10. **多任务分支**：分支内含多个任务时严格顺序推进（后者拿到前者输出），与其他分支并行、慢路不影响汇合顺序。
-11. **汇合点崩溃**：两路业务已执行但完成通知未处理时崩溃，恢复后按 at-least-once 补跑而汇合仍只执行一次。
-10. **原有用例**：重启恢复、幂等并发去重、20 实例并发隔离、重试/超时/终止语义全部保持通过；旧串行工作流行为不变。
+11. **汇合点崩溃**：两路业务已执行但完成通知未处理时崩溃，恢复后按 at-least-once 补跑而汇合仍只生效一次。
+12. **汇合隔离**：某实例的汇合一直阻塞时，其他实例仍能独立推进到 COMPLETED；放行后该实例也正常完成。
+13. **汇合重试**：汇合前两次抛 `RetryableException`、第三次成功 → 按退避重试后 COMPLETED，join attempt=3；重试耗尽（3 次都失败）→ FAILED。
+14. **汇合失败/超时终态**：汇合抛不可重试错误 → 立即 FAILED、后续任务 CANCELLED；汇合一直不返回且 `maxAttempts=1` → TIMED_OUT，
+    卡住的汇合线程收到中断，放行后的迟到返回不再改终态、不写输出、不重跑汇合。
+15. **汇合执行中崩溃**：汇合已进入处理体但完成未持久化时重启，恢复后汇合体按 at-least-once 再执行一次，最终只生效一次、输出正确。
+16. **原有用例**：重启恢复、幂等并发去重、20 实例并发隔离、重试/超时/终止语义全部保持通过；旧串行工作流行为不变。

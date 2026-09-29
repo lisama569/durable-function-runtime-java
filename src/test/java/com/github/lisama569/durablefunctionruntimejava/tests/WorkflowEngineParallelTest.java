@@ -31,6 +31,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 并行扇出/汇合：乱序完成结果一致、汇合一次、崩溃只补跑未完成分支、失败/超时取消兄弟。 */
@@ -199,6 +200,9 @@ class WorkflowEngineParallelTest {
         AtomicBoolean b2Interrupted = new AtomicBoolean();
         CountDownLatch slowEntered = new CountDownLatch(2);
         CountDownLatch release = new CountDownLatch(1);
+        // 两路慢任务都已进入处理体后再放行失败路：确保被取消的是「真正在跑」的兄弟任务，
+        // 而不是还没被调度到的任务（调度竞态会让该用例偶发失败）。
+        CountDownLatch failProceed = new CountDownLatch(1);
 
         WorkflowEngine engine = new WorkflowEngine(new FileWorkflowStore(dataDir));
         try {
@@ -210,6 +214,7 @@ class WorkflowEngineParallelTest {
                                 return "late-b0"; // 即使最终返回，迟到完成也必须被丢弃
                             }, FAST))),
                             new FlowBranch("one", List.of(new TaskNode("b1", (ctx, input) -> {
+                                failProceed.await(10, TimeUnit.SECONDS);
                                 throw new NonRetryableException("branch 1 exploded");
                             }, FAST))),
                             new FlowBranch("two", List.of(new TaskNode("b2", (ctx, input) -> {
@@ -224,10 +229,11 @@ class WorkflowEngineParallelTest {
             engine.registerFlow(definition);
 
             WorkflowInstance instance = engine.start("fanFail", "key-fail", "in");
+            assertTrue(slowEntered.await(5, TimeUnit.SECONDS), "两路慢任务都应已进入处理体");
+            failProceed.countDown(); // 此时再让第三路失败
             WorkflowInstance terminal = engine.awaitTerminal(instance.getId(), 10_000);
             assertNotNull(terminal);
             assertEquals(WorkflowStatus.FAILED, terminal.getStatus(), "一路彻底失败必须落入确定终态");
-            assertTrue(slowEntered.await(5, TimeUnit.SECONDS));
             assertTrue(b0Interrupted.get() || b2Interrupted.get(), "其他在跑的路应收到取消信号");
 
             assertEquals(StepStatus.FAILED, findRecord(terminal, "fan[1].b1").getStatus());
@@ -297,11 +303,17 @@ class WorkflowEngineParallelTest {
     // ---------------------------------------------------------------- 扇出上限
 
     @Test
-    void parallelBranchCountOverPerInstanceCapFailsImmediately() {
+    void parallelBranchCountOverPerInstanceCapIsRejectedBeforeAnyExecution() {
         AtomicInteger calls = new AtomicInteger();
         WorkflowEngine capped = new WorkflowEngine(new FileWorkflowStore(dataDir), 16, 2);
         try {
+            // 分支上限之上还放了一个前置任务：即便如此，超限也必须在流程真正开跑之前被拒绝，
+            // 前置任务绝不能先执行、产生副作用。
             FlowDefinition definition = new FlowDefinition("tooWide", List.of(
+                    new TaskNode("beforeFan", (ctx, in) -> {
+                        calls.incrementAndGet();
+                        return "before";
+                    }, FAST),
                     new ParallelNode("fan", List.of(
                             new FlowBranch("a", List.of(new TaskNode("a1", (ctx, in) -> {
                                 calls.incrementAndGet();
@@ -316,13 +328,38 @@ class WorkflowEngineParallelTest {
                                 return "c";
                             }, FAST)))),
                             (ctx, outputs) -> "joined")));
-            capped.registerFlow(definition);
+            IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
+                    () -> capped.registerFlow(definition),
+                    "超过扇出上限的定义必须在注册（真正开跑）阶段被明确拒绝");
+            assertTrue(error.getMessage().contains("exceeding configured cap 2"));
+            assertEquals(0, calls.get(), "被拒绝的流程不得执行任何任务，不产生任何副作用");
+        } finally {
+            capped.shutdown();
+        }
+    }
 
-            WorkflowInstance instance = capped.start("tooWide", "key-cap", "in");
+    @Test
+    void parallelBranchCountAtCapIsAcceptedAndRuns() {
+        AtomicInteger calls = new AtomicInteger();
+        WorkflowEngine capped = new WorkflowEngine(new FileWorkflowStore(dataDir), 16, 2);
+        try {
+            FlowDefinition definition = new FlowDefinition("atCap", List.of(
+                    new ParallelNode("fan", List.of(
+                            new FlowBranch("a", List.of(new TaskNode("a1", (ctx, in) -> {
+                                calls.incrementAndGet();
+                                return "a";
+                            }, FAST))),
+                            new FlowBranch("b", List.of(new TaskNode("b1", (ctx, in) -> {
+                                calls.incrementAndGet();
+                                return "b";
+                            }, FAST)))),
+                            (ctx, outputs) -> "joined")));
+            capped.registerFlow(definition); // 恰好等于上限：合法
+            WorkflowInstance instance = capped.start("atCap", "key-cap-ok", "in");
             WorkflowInstance terminal = capped.awaitTerminal(instance.getId(), 10_000);
             assertNotNull(terminal);
-            assertEquals(WorkflowStatus.FAILED, terminal.getStatus(), "超过单实例并行上限必须立即失败");
-            assertEquals(0, calls.get(), "超过上限的并行节点不得拉起任何任务");
+            assertEquals(WorkflowStatus.COMPLETED, terminal.getStatus());
+            assertEquals(2, calls.get());
         } finally {
             capped.shutdown();
         }
