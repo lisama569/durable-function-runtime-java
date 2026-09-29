@@ -31,6 +31,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 并行扇出/汇合：乱序完成结果一致、汇合一次、崩溃只补跑未完成分支、失败/超时取消兄弟。 */
@@ -199,6 +200,8 @@ class WorkflowEngineParallelTest {
         AtomicBoolean b2Interrupted = new AtomicBoolean();
         CountDownLatch slowEntered = new CountDownLatch(2);
         CountDownLatch release = new CountDownLatch(1);
+        // 让将失败的一路等待，直到两路慢任务都已进入其业务体，消除调度快慢导致的竞态。
+        CountDownLatch failGate = new CountDownLatch(1);
 
         WorkflowEngine engine = new WorkflowEngine(new FileWorkflowStore(dataDir));
         try {
@@ -210,6 +213,7 @@ class WorkflowEngineParallelTest {
                                 return "late-b0"; // 即使最终返回，迟到完成也必须被丢弃
                             }, FAST))),
                             new FlowBranch("one", List.of(new TaskNode("b1", (ctx, input) -> {
+                                failGate.await(5, TimeUnit.SECONDS);
                                 throw new NonRetryableException("branch 1 exploded");
                             }, FAST))),
                             new FlowBranch("two", List.of(new TaskNode("b2", (ctx, input) -> {
@@ -224,10 +228,11 @@ class WorkflowEngineParallelTest {
             engine.registerFlow(definition);
 
             WorkflowInstance instance = engine.start("fanFail", "key-fail", "in");
+            assertTrue(slowEntered.await(5, TimeUnit.SECONDS), "两路慢任务应都已开始执行，再让失败路抛错");
+            failGate.countDown();
             WorkflowInstance terminal = engine.awaitTerminal(instance.getId(), 10_000);
             assertNotNull(terminal);
             assertEquals(WorkflowStatus.FAILED, terminal.getStatus(), "一路彻底失败必须落入确定终态");
-            assertTrue(slowEntered.await(5, TimeUnit.SECONDS));
             assertTrue(b0Interrupted.get() || b2Interrupted.get(), "其他在跑的路应收到取消信号");
 
             assertEquals(StepStatus.FAILED, findRecord(terminal, "fan[1].b1").getStatus());
@@ -297,7 +302,7 @@ class WorkflowEngineParallelTest {
     // ---------------------------------------------------------------- 扇出上限
 
     @Test
-    void parallelBranchCountOverPerInstanceCapFailsImmediately() {
+    void parallelBranchCountOverPerInstanceCapRejectedBeforeAnyExecution() {
         AtomicInteger calls = new AtomicInteger();
         WorkflowEngine capped = new WorkflowEngine(new FileWorkflowStore(dataDir), 16, 2);
         try {
@@ -316,13 +321,15 @@ class WorkflowEngineParallelTest {
                                 return "c";
                             }, FAST)))),
                             (ctx, outputs) -> "joined")));
-            capped.registerFlow(definition);
-
-            WorkflowInstance instance = capped.start("tooWide", "key-cap", "in");
-            WorkflowInstance terminal = capped.awaitTerminal(instance.getId(), 10_000);
-            assertNotNull(terminal);
-            assertEquals(WorkflowStatus.FAILED, terminal.getStatus(), "超过单实例并行上限必须立即失败");
-            assertEquals(0, calls.get(), "超过上限的并行节点不得拉起任何任务");
+            // 超限配置在注册期（流程真正开跑之前）即被明确拒绝，可预期、无任何前置副作用。
+            IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
+                    () -> capped.registerFlow(definition));
+            assertTrue(error.getMessage().contains("exceeding per-instance cap"), error.getMessage());
+            assertEquals(0, calls.get(), "未注册成功的定义不得执行任何任务");
+            // 该流程名从未注册成功，启动同样被拒；不可能产生任何任务调用。
+            assertThrows(IllegalArgumentException.class,
+                    () -> capped.start("tooWide", "key-cap-never", "in"));
+            assertEquals(0, calls.get());
         } finally {
             capped.shutdown();
         }

@@ -14,6 +14,7 @@ import com.github.lisama569.durablefunctionruntimejava.workflow.FlowBranch;
 import com.github.lisama569.durablefunctionruntimejava.workflow.FlowDefinition;
 import com.github.lisama569.durablefunctionruntimejava.workflow.FlowNode;
 import com.github.lisama569.durablefunctionruntimejava.workflow.JoinContext;
+import com.github.lisama569.durablefunctionruntimejava.workflow.JoinHandler;
 import com.github.lisama569.durablefunctionruntimejava.workflow.ParallelNode;
 import com.github.lisama569.durablefunctionruntimejava.workflow.StepContext;
 import com.github.lisama569.durablefunctionruntimejava.workflow.TaskNode;
@@ -45,10 +46,13 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * 执行模型：
  * - 所有状态流转只发生在单线程事件循环中，保证同一实例的状态迁移唯一、有序；
- * - 业务任务在有界 worker 线程池执行，完成后向事件循环投递携带 (instanceId, path, attempt) 的通知；
+ * - 业务任务与汇合逻辑在有界 worker 线程池执行（汇合不占用事件循环，其慢/阻塞不会拖住其他实例），
+ *   完成后向事件循环投递携带 (instanceId, path, attempt) 的通知；
  * - 迟到/重复通知因路径、状态或 attempt 不匹配被丢弃，不导致计数错乱或重复推进；
- * - 分支选择未命中的分支任务原子标记 SKIPPED；并行各路独立推进，汇合在事件循环中恰好执行一次；
- * - 每次状态迁移先持久化再推进，重启后已完成的分支/任务不会重复执行，只补跑未完成部分。
+ * - 分支选择未命中的分支任务原子标记 SKIPPED；并行各路独立推进，汇合成功恰好执行一次；
+ * - 汇合沿用与普通任务一致的退避重试、超时与失败语义；终态失败/超时/终止会取消全部在跑任务（含阻塞中的汇合）；
+ * - 并行分支数上限在注册期校验，超限定义在流程开跑前即被拒绝；
+ * - 每次状态迁移先持久化再推进，重启后已完成的分支/任务/汇合不会重复执行，只补跑未完成部分。
  */
 public class WorkflowEngine {
 
@@ -77,12 +81,16 @@ public class WorkflowEngine {
                                 Map<String, PathLocation> locationByPath) {
     }
 
-    private enum EventKind { RUN_TASK, TASK_SUCCEEDED, TASK_FAILED, TASK_TIMED_OUT, RESUME, TERMINATE }
+    private enum EventKind { RUN_TASK, RUN_JOIN, TASK_SUCCEEDED, TASK_FAILED, TASK_TIMED_OUT, RESUME, TERMINATE }
 
     private record EngineEvent(EventKind kind, String instanceId, String path, int attempt,
                                String output, ErrorKind errorKind, String errorMessage) {
         static EngineEvent runTask(String instanceId, String path) {
             return new EngineEvent(EventKind.RUN_TASK, instanceId, path, 0, null, null, null);
+        }
+
+        static EngineEvent runJoin(String instanceId, String path) {
+            return new EngineEvent(EventKind.RUN_JOIN, instanceId, path, 0, null, null, null);
         }
 
         static EngineEvent succeeded(String instanceId, String path, int attempt, String output) {
@@ -296,6 +304,12 @@ public class WorkflowEngine {
 
     private void compileParallel(ParallelNode parallel, int nodeIndex,
                                  List<RecordSpec> specs, Set<String> seenPaths) {
+        // 注册期（流程真正开跑之前）即拒绝超限配置：结果确定可预期，绝不先执行部分步骤再报错。
+        if (parallel.branches().size() > maxParallelBranches) {
+            throw new IllegalArgumentException("parallel '" + parallel.name() + "' defines "
+                    + parallel.branches().size() + " branches, exceeding per-instance cap "
+                    + maxParallelBranches);
+        }
         Set<String> labels = new HashSet<>();
         for (int bi = 0; bi < parallel.branches().size(); bi++) {
             FlowBranch branch = parallel.branches().get(bi);
@@ -356,6 +370,7 @@ public class WorkflowEngine {
     private void handle(EngineEvent event) {
         switch (event.kind()) {
             case RUN_TASK -> onRunTask(event);
+            case RUN_JOIN -> onRunJoin(event);
             case TASK_SUCCEEDED -> onTaskSucceeded(event);
             case TASK_FAILED -> onTaskFailed(event);
             case TASK_TIMED_OUT -> onTaskTimedOut(event);
@@ -403,7 +418,9 @@ public class WorkflowEngine {
         record.setOutput(event.output());
         record.setErrorKind(null);
         record.setErrorMessage(null);
-        log.info("[instance={}] task={} attempt={} completed", instance.getId(), event.path(), event.attempt());
+        log.info("[instance={}] {}={} attempt={} completed",
+                instance.getId(), location.kind() == PathKind.JOIN ? "join" : "task",
+                event.path(), event.attempt());
 
         ExecutionState es = state(instance);
         switch (location.kind()) {
@@ -426,13 +443,24 @@ public class WorkflowEngine {
                     cursor.setStatus(BranchRunStatus.COMPLETED);
                 }
                 if (allBranchesCompleted(es)) {
-                    joinParallel(instance, flow, location.nodeIndex(), es);
+                    startJoin(instance, flow, location.nodeIndex());
                 } else {
                     persistOrThrow(instance);
                     drive(instance);
                 }
             }
-            case JOIN -> { /* 汇合记录不会从 worker 收到完成通知 */ }
+            case JOIN -> {
+                // 汇合成功与推进到下一顶层节点在同一次持久化中落盘（at-least-once 下汇合副作用需幂等）。
+                es.setActiveParallelNode(-1);
+                es.setParallelCursors(new ArrayList<>());
+                es.setRootPc(location.nodeIndex() + 1);
+                syncStepIndex(instance, es);
+                persistOrThrow(instance);
+                log.info("[instance={}] parallel={} joined once from {} branches",
+                        instance.getId(), parallelAt(flow, location.nodeIndex()).name(),
+                        parallelAt(flow, location.nodeIndex()).branches().size());
+                drive(instance);
+            }
         }
     }
 
@@ -453,10 +481,13 @@ public class WorkflowEngine {
         WorkflowInstance instance = opt.get();
         cancelRunningTask(event.instanceId(), event.path(), event.attempt());
         CompiledFlow flow = requireFlow(instance.getWorkflowName());
+        PathLocation location = flow.locationByPath().get(event.path());
+        boolean isJoin = location != null && location.kind() == PathKind.JOIN;
+        String message = isJoin ? "join exceeded timeout" : "step exceeded timeout";
         StepRecord record = recordAt(flow, instance, event.path());
         record.setErrorKind(ErrorKind.TIMEOUT);
-        record.setErrorMessage("step exceeded timeout");
-        failOrRetry(instance, flow, event.path(), event.attempt(), ErrorKind.TIMEOUT, "step exceeded timeout");
+        record.setErrorMessage(message);
+        failOrRetry(instance, flow, event.path(), event.attempt(), ErrorKind.TIMEOUT, message);
     }
 
     private void onTerminate(String instanceId) {
@@ -575,13 +606,7 @@ public class WorkflowEngine {
 
         if (node instanceof ParallelNode parallel) {
             if (es.getActiveParallelNode() != pc) {
-                // 首次到达：校验扇出上限，初始化每条分支的游标。
-                if (parallel.branches().size() > maxParallelBranches) {
-                    failInstance(instance, WorkflowStatus.FAILED, ErrorKind.NON_RETRYABLE,
-                            "parallel '" + parallel.name() + "' defines " + parallel.branches().size()
-                                    + " branches, exceeding per-instance cap " + maxParallelBranches, null);
-                    return;
-                }
+                // 首次到达：初始化每条分支的游标（分支数上限已在注册期校验，超限定义无法注册）。
                 String upstream = nodeInput(flow, instance, pc);
                 List<ParallelCursor> cursors = new ArrayList<>();
                 for (int bi = 0; bi < parallel.branches().size(); bi++) {
@@ -617,41 +642,94 @@ public class WorkflowEngine {
             }
             if (!items.isEmpty()) {
                 dispatch(instance, items);
+                return;
+            }
+            // 没有处于头部的待执行任务：若所有分支都已完成（恢复/补跑场景），补发起尚未执行的汇合。
+            if (allBranchesCompleted(es)) {
+                StepRecord joinRecord = recordAt(flow, instance, joinPath(parallel.name()));
+                if (joinRecord.getStatus() == StepStatus.PENDING) {
+                    startJoin(instance, flow, pc);
+                }
             }
         }
     }
 
-    /** 全部分支完成后执行汇合：恰好一次，输出按分支定义顺序聚合，与完成先后无关。 */
-    private void joinParallel(WorkflowInstance instance, CompiledFlow flow, int nodeIndex, ExecutionState es) {
+    /**
+     * 全部分支完成后启动汇合：输出按分支定义顺序聚合（与完成先后无关），汇合记录置 RUNNING 后落盘，
+     * 再把汇合交给 worker 线程池执行，<b>不阻塞事件循环</b>——某个实例的汇合再慢甚至永久阻塞，
+     * 同进程其他实例的事件仍能被事件循环及时处理。重试/超时/失败语义与普通任务一致。
+     */
+    private void startJoin(WorkflowInstance instance, CompiledFlow flow, int nodeIndex) {
         ParallelNode parallel = parallelAt(flow, nodeIndex);
         StepRecord joinRecord = recordAt(flow, instance, joinPath(parallel.name()));
         if (joinRecord.getStatus() != StepStatus.PENDING) {
-            return; // 汇合已执行过（防御性检查）
+            return; // 汇合已派发/已完成（防御性检查，保证恰好一次派发）
         }
+        List<String> outputs = collectJoinOutputs(flow, instance, parallel);
+        int attempt = joinRecord.getAttempt() + 1;
+        joinRecord.setStatus(StepStatus.RUNNING);
+        joinRecord.setAttempt(attempt);
+        joinRecord.setErrorKind(null);
+        joinRecord.setErrorMessage(null);
+        persistOrThrow(instance);
+        submitJoin(instance, parallel, outputs, attempt);
+        log.info("[instance={}] join={} attempt={} started", instance.getId(), joinRecord.getPath(), attempt);
+    }
+
+    /** 汇合退避后重跑（RUN_JOIN 事件在事件循环中处理，校验仍位于汇合头后再次派发）。 */
+    private void onRunJoin(EngineEvent event) {
+        Optional<WorkflowInstance> opt = store.findById(event.instanceId());
+        if (opt.isEmpty()) return;
+        WorkflowInstance instance = opt.get();
+        if (instance.getStatus() != WorkflowStatus.RUNNING) return;
+        CompiledFlow flow = requireFlow(instance.getWorkflowName());
+        PathLocation location = flow.locationByPath().get(event.path());
+        if (location == null || location.kind() != PathKind.JOIN) return;
+        ExecutionState es = state(instance);
+        if (!isExpectedHead(es, flow, location, event.path())) return;
+        StepRecord joinRecord = recordAt(flow, instance, event.path());
+        if (joinRecord.getStatus() != StepStatus.PENDING) return; // 重复/迟到的调度
+        startJoin(instance, flow, location.nodeIndex());
+    }
+
+    private static List<String> collectJoinOutputs(CompiledFlow flow, WorkflowInstance instance, ParallelNode parallel) {
         List<String> outputs = new ArrayList<>();
         for (int bi = 0; bi < parallel.branches().size(); bi++) {
             FlowBranch branch = parallel.branches().get(bi);
             TaskNode last = branch.tasks().get(branch.tasks().size() - 1);
             outputs.add(recordAt(flow, instance, parallelPath(parallel.name(), bi, last.name())).getOutput());
         }
-        String joined;
-        try {
-            joined = parallel.join().join(new JoinContext(instance.getId(), parallel.name()), outputs);
-        } catch (Exception e) {
-            failInstance(instance, WorkflowStatus.FAILED, ErrorKind.NON_RETRYABLE,
-                    "parallel join failed: " + e, null);
-            return;
-        }
-        joinRecord.setStatus(StepStatus.COMPLETED);
-        joinRecord.setOutput(joined);
-        es.setActiveParallelNode(-1);
-        es.setParallelCursors(new ArrayList<>());
-        es.setRootPc(nodeIndex + 1);
-        syncStepIndex(instance, es);
-        persistOrThrow(instance);
-        log.info("[instance={}] parallel={} joined once from {} branches",
-                instance.getId(), parallel.name(), parallel.branches().size());
-        drive(instance);
+        return outputs;
+    }
+
+    private void submitJoin(WorkflowInstance instance, ParallelNode parallel, List<String> outputs, int attempt) {
+        String instanceId = instance.getId();
+        String path = joinPath(parallel.name());
+        JoinContext context = new JoinContext(instanceId, parallel.name());
+        JoinHandler handler = parallel.join();
+        RetryPolicy policy = parallel.joinRetryPolicy();
+
+        Future<?> future = workers.submit(() -> {
+            try {
+                String joined = handler.join(context, outputs);
+                eventQueue.add(EngineEvent.succeeded(instanceId, path, attempt, joined));
+            } catch (RetryableException e) {
+                eventQueue.add(EngineEvent.failed(instanceId, path, attempt, ErrorKind.RETRYABLE, e.getMessage()));
+            } catch (NonRetryableException e) {
+                eventQueue.add(EngineEvent.failed(instanceId, path, attempt, ErrorKind.NON_RETRYABLE, e.getMessage()));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                // 被超时/终态失败/终止取消：不投递通知，状态已由事件循环推进。
+            } catch (Exception e) {
+                // 未分类异常默认不可重试，避免无限重试放大故障。
+                eventQueue.add(EngineEvent.failed(instanceId, path, attempt, ErrorKind.NON_RETRYABLE, e.toString()));
+            } finally {
+                runningTasks.remove(taskKey(instanceId, path, attempt));
+            }
+        });
+        runningTasks.put(taskKey(instanceId, path, attempt), future);
+        scheduler.schedule(() -> eventQueue.add(EngineEvent.timedOut(instanceId, path, attempt)),
+                policy.stepTimeoutMillis(), TimeUnit.MILLISECONDS);
     }
 
     // ---------------------------------------------------------------- 失败/重试
@@ -660,26 +738,40 @@ public class WorkflowEngine {
     private void failOrRetry(WorkflowInstance instance, CompiledFlow flow, String path, int attempt,
                              ErrorKind kind, String message) {
         StepRecord record = recordAt(flow, instance, path);
-        RetryPolicy policy = flow.locationByPath().get(path) != null
-                ? resolveTask(flow, flow.locationByPath().get(path)).retryPolicy()
-                : RetryPolicy.defaults();
+        PathLocation location = flow.locationByPath().get(path);
+        RetryPolicy policy = policyForPath(flow, location);
+        boolean isJoin = location != null && location.kind() == PathKind.JOIN;
+        String attributedMessage = isJoin ? "parallel join failed: " + message : message;
 
         if (kind == ErrorKind.NON_RETRYABLE) {
-            failInstance(instance, WorkflowStatus.FAILED, kind, message, record);
+            failInstance(instance, WorkflowStatus.FAILED, kind, attributedMessage, record);
             return;
         }
         if (attempt < policy.maxAttempts()) {
             long backoff = policy.backoffForAttempt(attempt);
             record.setStatus(StepStatus.PENDING);
+            record.setErrorMessage(message);
             persistOrThrow(instance);
-            log.warn("[instance={}] task={} attempt={} failed ({}), retry in {}ms: {}",
-                    instance.getId(), path, attempt, kind, backoff, message);
-            scheduler.schedule(() -> eventQueue.add(EngineEvent.runTask(instance.getId(), path)),
-                    backoff, TimeUnit.MILLISECONDS);
+            log.warn("[instance={}] {}={} attempt={} failed ({}), retry in {}ms: {}",
+                    instance.getId(), isJoin ? "join" : "task", path, attempt, kind, backoff, message);
+            // 汇合与任务走各自的重跑事件；迟到的旧 attempt 通知仍会被状态/attempt/执行头校验丢弃。
+            EngineEvent retry = isJoin
+                    ? EngineEvent.runJoin(instance.getId(), path)
+                    : EngineEvent.runTask(instance.getId(), path);
+            scheduler.schedule(() -> eventQueue.add(retry), backoff, TimeUnit.MILLISECONDS);
             return;
         }
         WorkflowStatus terminal = kind == ErrorKind.TIMEOUT ? WorkflowStatus.TIMED_OUT : WorkflowStatus.FAILED;
-        failInstance(instance, terminal, kind, message, record);
+        failInstance(instance, terminal, kind, attributedMessage, record);
+    }
+
+    /** 任务路径取任务自身策略；汇合路径取并行节点的汇合策略。 */
+    private RetryPolicy policyForPath(CompiledFlow flow, PathLocation location) {
+        if (location == null) return RetryPolicy.defaults();
+        if (location.kind() == PathKind.JOIN) {
+            return parallelAt(flow, location.nodeIndex()).joinRetryPolicy();
+        }
+        return resolveTask(flow, location).retryPolicy();
     }
 
     /**
@@ -828,7 +920,10 @@ public class WorkflowEngine {
                 if (cursor == null || cursor.getStatus() != BranchRunStatus.RUNNING) yield false;
                 yield parallelHeadPath(flow, location.nodeIndex(), cursor).equals(path);
             }
-            case JOIN -> false;
+            case JOIN ->
+                // 汇合头：并行节点仍激活（汇合尚未成功落盘）且所有分支都已完成。
+                // 正在执行/退避重试中的汇合同样满足，便于通知与重跑事件匹配。
+                es.getActiveParallelNode() == location.nodeIndex() && allBranchesCompleted(es);
         };
     }
 
